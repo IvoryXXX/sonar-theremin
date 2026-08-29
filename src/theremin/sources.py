@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -220,10 +221,22 @@ def parse_serial_line(line: str) -> SensorFrame | None:
     line = line.strip()
     if not line:
         return None
+
+    # Debug lines from the PlatformIO test sketch: pitch=245 mm  volume=180 mm
+    debug = re.search(
+        r"pitch\s*=\s*(-?\d+(?:\.\d+)?).*volume\s*=\s*(-?\d+(?:\.\d+)?)",
+        line,
+        re.IGNORECASE,
+    )
+    if debug:
+        ranges = (parse_mm(debug.group(1)), parse_mm(debug.group(2)))
+        if any(v is not None for v in ranges):
+            return SensorFrame(time.time_ns(), ranges, source="serial")
+
     parts = [p for p in line.replace(";", ",").split(",") if p != ""]
     if not parts:
         return None
-    ranges = tuple(parse_mm(part) for part in parts)
+    ranges = tuple(parse_mm(part) for part in parts[:2])
     if all(v is None for v in ranges) and not any(ch.isdigit() for ch in line):
         return None
     return SensorFrame(time.time_ns(), ranges, source="serial")

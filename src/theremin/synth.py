@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import numpy as np
 
@@ -12,16 +13,16 @@ VOICES = {
         "wave": "sine",
         "wave2": "sine",
         "detune": 1200.0,
-        "mix2": 0.18,
+        "mix2": 0.14,
         "sub": 0.0,
-        "noise": 0.05,
-        "cutoff": 0.42,
+        "noise": 0.08,
+        "cutoff": 0.48,
         "drive": 1.0,
         "crush": 0.0,
-        "portamento_s": 0.04,
-        "attack_s": 0.045,
-        "release_s": 0.2,
-        "gain": 1.15,
+        "portamento_s": 0.035,
+        "attack_s": 0.055,
+        "release_s": 0.18,
+        "gain": 1.2,
     },
     "Varhany": {
         "wave": "organ",
@@ -128,13 +129,46 @@ VOICES = {
         "release_s": 0.16,
         "gain": 0.85,
     },
+    # Clean continuous-pitch voice for rezim Nastroj (theremin)
+    "Theremin": {
+        "wave": "sine",
+        "wave2": "sine",
+        "detune": 7.0,
+        "mix2": 0.12,
+        "sub": 0.06,
+        "noise": 0.0,
+        "cutoff": 0.92,
+        "drive": 1.04,
+        "crush": 0.0,
+        "portamento_s": 0.045,
+        "attack_s": 0.02,
+        "release_s": 0.22,
+        "gain": 1.05,
+        "pluck": False,
+    },
+    # Karplus-Strong guitar string — normal sustained voice (pluck via envelope in apply_voice)
+    "Kytara": {
+        "wave": "saw",
+        "wave2": "triangle",
+        "detune": 2.0,
+        "mix2": 0.2,
+        "sub": 0.08,
+        "noise": 0.0,
+        "cutoff": 0.72,
+        "drive": 1.15,
+        "crush": 0.0,
+        "portamento_s": 0.001,
+        "attack_s": 0.003,
+        "release_s": 0.9,
+        "gain": 1.35,
+    },
 }
 
 VOICE_NAMES = tuple(VOICES.keys())
 
 
 class Synth:
-    def __init__(self, sample_rate: int = 48000, master: float = 0.2) -> None:
+    def __init__(self, sample_rate: int = 48000, master: float = 0.4) -> None:
         self.sample_rate = sample_rate
         self.master = master
         self.timbre = "Pistala"
@@ -154,6 +188,8 @@ class Synth:
         self.release_s = 0.07
         self.muted = False
         self.drum_gain = 0.7
+        self.guitar_active = False  # set by app when Kytara mode button is on
+        self.flute_active = False  # breath + fingering
         self._freq = 220.0
         self._amp = 0.0
         self._target_freq = 220.0
@@ -174,6 +210,11 @@ class Synth:
         self._rng = np.random.default_rng(7)
         self._stream = None
         self.error: str | None = None
+        self._xruns = 0
+        self._callback_errors = 0
+        self._last_watchdog = 0.0
+        self._ring_until = 0.0  # monotonic: force audible amp until this time
+        self._guitar_open = False  # note is ringing; left hand modulates length live
         self.apply_timbre("Pistala")
 
     def start(self) -> None:
@@ -182,16 +223,19 @@ class Synth:
         except ImportError:
             self.error = "sounddevice is not installed"
             return
+        self.stop()
         try:
+            # Bigger blocks + higher latency = fewer dropouts on Windows under UI load.
             self._stream = sd.OutputStream(
                 samplerate=self.sample_rate,
                 channels=1,
                 dtype="float32",
-                blocksize=256,
-                latency="low",
+                blocksize=1024,
+                latency=0.08,
                 callback=self._callback,
             )
             self._stream.start()
+            self.error = None
         except Exception as exc:  # noqa: BLE001
             self.error = str(exc)
             self._stream = None
@@ -199,21 +243,109 @@ class Synth:
     def stop(self) -> None:
         if self._stream is not None:
             try:
-                self._stream.stop()
+                self._stream.abort()
+            except Exception:
+                pass
+            try:
                 self._stream.close()
             except Exception:
                 pass
             self._stream = None
 
+    def is_alive(self) -> bool:
+        stream = self._stream
+        try:
+            return stream is not None and bool(getattr(stream, "active", False))
+        except Exception:
+            return False
+
+    def ensure_running(self, now: float | None = None) -> bool:
+        """Restart the PortAudio stream if it died (common after long play / device sleep)."""
+        t = time.monotonic() if now is None else now
+        if t - self._last_watchdog < 0.5:
+            return self.is_alive()
+        self._last_watchdog = t
+        if self.is_alive():
+            return True
+        self.start()
+        return self.is_alive()
+
     def apply_voice(self, voice: Voice) -> None:
         if voice.frequency_hz > 0.0:
-            self._target_freq = voice.frequency_hz
-        if voice.retrigger:
-            self._amp *= 0.12
+            self._target_freq = max(40.0, float(voice.frequency_hz))
         if self.muted:
             self._target_amp = 0.0
-        else:
+            self._guitar_open = False
+            return
+
+        now = time.monotonic()
+
+        if self.guitar_active:
+            # Left hand = LENGTH, live while the note rings.
+            # Closer = shorten / mute; farther = hold / long decay.
+            raw = float(voice.amplitude) if voice.amplitude > 0.0 else 0.55
+            raw = float(np.clip(raw, 0.0, 1.0))
+            # volume_amplitude is "closer = louder"; invert so closer = shorter.
+            sustain = 1.0 - raw
+            sustain_s = 0.06 + 5.0 * sustain  # ~0.06s … ~5.0s
+            peak = max(float(self.master), 0.3) * 0.9
+            self.attack_s = 0.003
+            self.portamento_s = 0.001
+            self.release_s = sustain_s
+
+            if voice.retrigger and voice.frequency_hz > 0.0:
+                self._freq = self._target_freq
+                self._amp = 0.0
+                self._target_amp = peak
+                self._guitar_open = True
+                self._ring_until = now + 0.05  # short attack, then left hand takes over
+                return
+
+            if voice.gate and voice.frequency_hz > 0.0:
+                self._guitar_open = True
+                # Far left = hold; bring left closer = shorten toward mute.
+                if sustain >= 0.88:
+                    self._target_amp = peak
+                else:
+                    self._target_amp = 0.0
+                return
+
+            if self._guitar_open:
+                # Real-time: close = kill fast, far = keep sounding.
+                if now < self._ring_until:
+                    self._target_amp = peak
+                elif sustain >= 0.88:
+                    self._target_amp = max(float(self._amp), peak * 0.55)
+                    self.release_s = 0.35
+                else:
+                    self._target_amp = 0.0
+                if self._amp < 0.008 and now >= self._ring_until:
+                    self._guitar_open = False
+                return
+
+            self._target_amp = 0.0
+            return
+
+        if self.flute_active:
+            # Soft breath: amplitude = blow strength; soft attack already in patch.
+            self.attack_s = 0.05
+            self.release_s = 0.16
+            self.portamento_s = 0.03
+            if voice.retrigger:
+                self._amp *= 0.35  # light tongue
             self._target_amp = voice.amplitude * self.master if voice.gate else 0.0
+            # A little extra air noise while blowing
+            self.noise = 0.06 + 0.1 * float(np.clip(voice.amplitude, 0.0, 1.0))
+            return
+
+        # Forced ring (test pluck) for non-guitar paths.
+        if now < self._ring_until:
+            self._target_amp = max(float(self.master), 0.3) * 0.9
+            return
+
+        if voice.retrigger:
+            self._amp *= 0.12
+        self._target_amp = voice.amplitude * self.master if voice.gate else 0.0
 
     def apply_timbre(self, name: str) -> None:
         if name not in VOICES:
@@ -236,6 +368,21 @@ class Synth:
 
     def silence(self) -> None:
         self._target_amp = 0.0
+        self._ring_until = 0.0
+        self._guitar_open = False
+
+    def pluck_test(self, freq: float = 220.0) -> None:
+        """Must be audible when enabling Kytara mode."""
+        self.apply_timbre("Kytara")
+        self.guitar_active = True
+        self._target_freq = float(freq)
+        self._freq = float(freq)
+        self._amp = 0.0
+        self._target_amp = max(float(self.master), 0.3) * 0.9
+        self._guitar_open = True
+        self._ring_until = time.monotonic() + 0.08
+        self.release_s = 1.2
+        self.attack_s = 0.003
 
     def trigger_kick(self) -> None:
         self._kick_trig = True
@@ -246,58 +393,75 @@ class Synth:
     def trigger_snare(self) -> None:
         self._snare_trig = True
 
-    def _callback(self, outdata, frames, _time_info, _status) -> None:  # noqa: ANN001
-        sr = float(self.sample_rate)
-        n = np.arange(frames, dtype=np.float64)
-        kf = 1.0 - math.exp(-1.0 / max(self.portamento_s * sr, 1.0))
-        if self._target_amp >= self._amp:
-            ka = 1.0 - math.exp(-1.0 / max(self.attack_s * sr, 1.0))
-        else:
-            ka = 1.0 - math.exp(-1.0 / max(self.release_s * sr, 1.0))
-        freq = self._target_freq + (self._freq - self._target_freq) * (1.0 - kf) ** n
-        amp = self._target_amp + (self._amp - self._target_amp) * (1.0 - ka) ** n
-        phase = self._phase + np.cumsum(freq / sr)
-        osc = _oscillator(phase, self.waveform)
-        if self.mix2 > 0.0:
-            ratio = 2.0 ** (self.detune / 1200.0)
-            phase2 = self._phase2 + np.cumsum(freq * ratio / sr)
-            osc = (1.0 - self.mix2) * osc + self.mix2 * _oscillator(phase2, self.waveform2)
-            self._phase2 = float(phase2[-1] % 1.0)
-        else:
-            self._phase2 = float(self._phase2)
-        if self.sub > 0.0:
-            sub_phase = self._sub_phase + np.cumsum(0.5 * freq / sr)
-            osc = osc + self.sub * np.sin(2.0 * np.pi * (sub_phase % 1.0))
-            self._sub_phase = float(sub_phase[-1] % 1.0)
-        if self.noise > 0.0:
-            osc = osc + self.noise * self._rng.uniform(-1.0, 1.0, frames)
-        if self.crush > 1.0:
-            osc = np.round(osc * self.crush) / self.crush
-        if self.drive > 1.02:
-            osc = np.tanh(self.drive * osc) / math.tanh(self.drive)
-        bright = float(np.clip(self.cutoff + (self.brightness - 0.5) * 0.75, 0.02, 0.99))
-        if bright < 0.93:
-            osc = self._lowpass(osc, bright)
-        else:
-            self._lp = float(osc[-1])
-        lead = amp * self.gain * osc
-        drums = self._drums(n, sr, frames) * (0.0 if self.muted else self.drum_gain)
-        out = (lead + drums).astype(np.float32)
-        np.clip(out, -0.95, 0.95, out=out)
-        outdata[:, 0] = out
-        self._phase = float(phase[-1] % 1.0)
-        self._freq = float(freq[-1])
-        self._amp = float(amp[-1])
+    def _callback(self, outdata, frames, _time_info, status) -> None:  # noqa: ANN001
+        try:
+            if status:
+                self._xruns += 1
+            sr = float(self.sample_rate)
+            n = np.arange(frames, dtype=np.float64)
+            target_freq = float(np.nan_to_num(self._target_freq, nan=220.0))
+            target_amp = float(np.nan_to_num(self._target_amp, nan=0.0))
+            cur_freq = float(np.nan_to_num(self._freq, nan=220.0))
+            cur_amp = float(np.nan_to_num(self._amp, nan=0.0))
+            if target_freq < 40.0:
+                target_freq = 220.0
+            if cur_freq < 40.0:
+                cur_freq = target_freq
+            kf = 1.0 - math.exp(-1.0 / max(self.portamento_s * sr, 1.0))
+            if target_amp >= cur_amp:
+                ka = 1.0 - math.exp(-1.0 / max(self.attack_s * sr, 1.0))
+            else:
+                ka = 1.0 - math.exp(-1.0 / max(self.release_s * sr, 1.0))
+            freq = target_freq + (cur_freq - target_freq) * (1.0 - kf) ** n
+            amp = target_amp + (cur_amp - target_amp) * (1.0 - ka) ** n
+            phase = self._phase + np.cumsum(freq / sr)
+            osc = _oscillator(phase, self.waveform)
+            if self.mix2 > 0.0:
+                ratio = 2.0 ** (self.detune / 1200.0)
+                phase2 = self._phase2 + np.cumsum(freq * ratio / sr)
+                osc = (1.0 - self.mix2) * osc + self.mix2 * _oscillator(phase2, self.waveform2)
+                self._phase2 = float(phase2[-1] % 1.0)
+            if self.sub > 0.0:
+                sub_phase = self._sub_phase + np.cumsum(0.5 * freq / sr)
+                osc = osc + self.sub * np.sin(2.0 * np.pi * (sub_phase % 1.0))
+                self._sub_phase = float(sub_phase[-1] % 1.0)
+            if self.noise > 0.0:
+                osc = osc + self.noise * self._rng.uniform(-1.0, 1.0, frames)
+            if self.crush > 1.0:
+                osc = np.round(osc * self.crush) / self.crush
+            if self.drive > 1.02:
+                osc = np.tanh(self.drive * osc) / math.tanh(self.drive)
+            bright = float(np.clip(self.cutoff + (self.brightness - 0.5) * 0.75, 0.02, 0.99))
+            if bright < 0.82:
+                osc = self._lowpass(osc, bright)
+            else:
+                self._lp = float(osc[-1])
+            lead = amp * self.gain * osc
+            drums = self._drums(n, sr, frames) * (0.0 if self.muted else self.drum_gain * self.master * 4.0)
+            out = (lead + drums).astype(np.float32)
+            np.nan_to_num(out, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            np.clip(out, -0.95, 0.95, out=out)
+            outdata[:, 0] = out
+            self._phase = float(phase[-1] % 1.0)
+            self._freq = float(freq[-1])
+            self._amp = float(amp[-1])
+        except Exception:  # noqa: BLE001
+            self._callback_errors += 1
+            outdata.fill(0.0)
 
     def _lowpass(self, signal: np.ndarray, cutoff: float) -> np.ndarray:
         hz = 160.0 * (14000.0 / 160.0) ** float(cutoff)
         alpha = 1.0 - math.exp(-2.0 * math.pi * hz / self.sample_rate)
-        out = np.empty_like(signal)
-        state = self._lp
-        for i, sample in enumerate(signal):
-            state += alpha * (sample - state)
+        out = np.empty(signal.shape[0], dtype=np.float64)
+        state = float(self._lp)
+        if not math.isfinite(state):
+            state = 0.0
+        aa = float(alpha)
+        sig = signal
+        for i in range(sig.shape[0]):
+            state += aa * (float(sig[i]) - state)
             out[i] = state
-        self._lp = float(state)
+        self._lp = state if math.isfinite(state) else 0.0
         return out
 
     def _drums(self, n: np.ndarray, sr: float, frames: int) -> np.ndarray:
