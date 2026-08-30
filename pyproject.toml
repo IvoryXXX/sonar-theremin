@@ -11,7 +11,8 @@ dependencies = [
 ]
 
 [project.scripts]
-theremin = "theremin.app:main"
+theremin = "theremin.__main__:main"
+sampler = "theremin.sampler_app:main"
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -2,10 +2,24 @@ from __future__ import annotations
 
 import math
 import time
+from dataclasses import dataclass
 
 import numpy as np
 
+from theremin.sampler import SampleBank
 from theremin.types import Voice
+
+
+@dataclass
+class _SampleVoice:
+    buf: np.ndarray
+    pos: int = 0
+    gain: float = 0.0
+    peak: float = 0.5
+    release_s: float = 0.1
+
+
+MAX_SAMPLE_VOICES = 20
 
 # Named like keyboard Tone/Voice: same notes, different colour.
 VOICES = {
@@ -190,6 +204,22 @@ class Synth:
         self.drum_gain = 0.7
         self.guitar_active = False  # set by app when Kytara mode button is on
         self.flute_active = False  # breath + fingering
+        self.sampler_active = False
+        self._sample_bank = SampleBank(sample_rate=sample_rate)
+        self._spl_voices: list[_SampleVoice] = []
+        self._sampler_master = 1.0
+        self._sampler_master_target = 1.0
+        self._spl_attack_s = 0.002
+        self._dj_filter = 0.75
+        self._dj_filter_target = 0.75
+        self._dj_lp = 0.0
+        self._dj_echo = 0.0
+        self._dj_echo_target = 0.0
+        self._dj_drive = 0.0
+        self._dj_drive_target = 0.0
+        self._dj_delay: np.ndarray | None = None
+        self._dj_delay_pos = 0
+        self._dj_delay_len = 0
         self._freq = 220.0
         self._amp = 0.0
         self._target_freq = 220.0
@@ -236,6 +266,10 @@ class Synth:
             )
             self._stream.start()
             self.error = None
+            n = int(self.sample_rate * 0.55)
+            self._dj_delay = np.zeros(max(n, 2048), dtype=np.float64)
+            self._dj_delay_len = self._dj_delay.shape[0]
+            self._dj_delay_pos = 0
         except Exception as exc:  # noqa: BLE001
             self.error = str(exc)
             self._stream = None
@@ -276,9 +310,14 @@ class Synth:
         if self.muted:
             self._target_amp = 0.0
             self._guitar_open = False
+            self._stop_sample()
             return
 
         now = time.monotonic()
+
+        if self.sampler_active:
+            self._apply_sampler_voice(voice, now)
+            return
 
         if self.guitar_active:
             # Left hand = LENGTH, live while the note rings.
@@ -347,6 +386,84 @@ class Synth:
             self._amp *= 0.12
         self._target_amp = voice.amplitude * self.master if voice.gate else 0.0
 
+    def _apply_sampler_voice(self, voice: Voice, now: float) -> None:
+        self._sampler_master_target = 1.0
+
+    def set_dj_mix(
+        self,
+        filter_cut: float,
+        echo: float,
+        drive: float = 0.0,
+        delay_s: float | None = None,
+    ) -> None:
+        self._dj_filter_target = float(np.clip(filter_cut, 0.05, 0.99))
+        self._dj_echo_target = float(np.clip(echo, 0.0, 0.85))
+        self._dj_drive_target = float(np.clip(drive, 0.0, 0.55))
+        if delay_s is not None and self._dj_delay is not None:
+            want = int(np.clip(delay_s * self.sample_rate, 512, self.sample_rate * 0.75))
+            if abs(want - self._dj_delay_len) > 64:
+                self._dj_delay = np.zeros(want, dtype=np.float64)
+                self._dj_delay_len = want
+                self._dj_delay_pos = 0
+
+    def _process_dj_fx(self, sample: float) -> float:
+        cf = self._dj_filter + (self._dj_filter_target - self._dj_filter) * 0.14
+        self._dj_filter = cf
+        self._dj_echo += (self._dj_echo_target - self._dj_echo) * 0.1
+        self._dj_drive += (self._dj_drive_target - self._dj_drive) * 0.08
+        x = sample
+        if self._dj_drive > 0.01:
+            x = math.tanh(x * (1.0 + self._dj_drive * 2.8))
+        hz = 70.0 * (18000.0 / 70.0) ** cf
+        alpha = 1.0 - math.exp(-2.0 * math.pi * hz / self.sample_rate)
+        self._dj_lp += alpha * (x - self._dj_lp)
+        out = self._dj_lp
+        if self._dj_delay is not None and self._dj_echo > 0.01:
+            delayed = float(self._dj_delay[self._dj_delay_pos])
+            wet = delayed * self._dj_echo
+            out = out * (1.0 - self._dj_echo * 0.35) + wet
+            self._dj_delay[self._dj_delay_pos] = out * 0.58
+            self._dj_delay_pos = (self._dj_delay_pos + 1) % self._dj_delay.shape[0]
+        return out
+
+    def _stop_sample(self) -> None:
+        self._spl_voices.clear()
+
+    def trigger_sample(self, index: int, peak: float | None = None) -> None:
+        if self.muted:
+            return
+        buf = self._sample_bank.get(int(index))
+        if buf.size < 2:
+            return
+        p = float(np.clip(peak if peak is not None else max(float(self.master), 0.4), 0.06, 1.0))
+        rel = 0.05 if int(index) == 2 else 0.11
+        self._spl_voices.append(_SampleVoice(buf=buf, peak=p, release_s=rel))
+        while len(self._spl_voices) > MAX_SAMPLE_VOICES:
+            self._spl_voices.pop(0)
+
+    def _render_sample(self, frames: int, sr: float) -> np.ndarray:
+        if not self._spl_voices:
+            self._sampler_master += (self._sampler_master_target - self._sampler_master) * 0.08
+            return np.zeros(frames, dtype=np.float64)
+        out = np.zeros(frames, dtype=np.float64)
+        ka_m = 1.0 - math.exp(-1.0 / max(0.025 * sr, 1.0))
+        ka_up = 1.0 - math.exp(-1.0 / max(self._spl_attack_s * sr, 1.0))
+        master = self._sampler_master
+        target_m = self._sampler_master_target
+        for fi in range(frames):
+            master += (target_m - master) * ka_m
+            mix = 0.0
+            for v in self._spl_voices:
+                if v.pos >= v.buf.shape[0]:
+                    continue
+                v.gain += (v.peak - v.gain) * ka_up
+                mix += float(v.buf[v.pos]) * v.gain
+                v.pos += 1
+            out[fi] = self._process_dj_fx(math.tanh(mix * master * 1.35))
+        self._sampler_master = master
+        self._spl_voices = [v for v in self._spl_voices if v.pos < v.buf.shape[0]]
+        return out
+
     def apply_timbre(self, name: str) -> None:
         if name not in VOICES:
             name = "Pistala"
@@ -370,6 +487,7 @@ class Synth:
         self._target_amp = 0.0
         self._ring_until = 0.0
         self._guitar_open = False
+        self._stop_sample()
 
     def pluck_test(self, freq: float = 220.0) -> None:
         """Must be audible when enabling Kytara mode."""
@@ -436,7 +554,10 @@ class Synth:
                 osc = self._lowpass(osc, bright)
             else:
                 self._lp = float(osc[-1])
-            lead = amp * self.gain * osc
+            if self.sampler_active:
+                lead = self._render_sample(frames, sr) * 1.35
+            else:
+                lead = amp * self.gain * osc
             drums = self._drums(n, sr, frames) * (0.0 if self.muted else self.drum_gain * self.master * 4.0)
             out = (lead + drums).astype(np.float32)
             np.nan_to_num(out, copy=False, nan=0.0, posinf=0.0, neginf=0.0)

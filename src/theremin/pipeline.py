@@ -6,6 +6,7 @@ from math import log2
 
 import numpy as np
 
+from theremin.sampler import sample_index_for_note
 from theremin.types import SensorFrame, Stats, Voice
 
 
@@ -115,6 +116,7 @@ class RuntimeConfig:
     nastroj_mode: bool = False
     guitar_mode: bool = False
     flute_mode: bool = False  # breath (vol) + fingering (pitch)
+    sampler_mode: bool = False  # gesture triggers built-in samples
     snap_pick: bool = False  # swipe once → play only the nearest/winning note
     play_portamento_s: float = 0.01
 
@@ -297,7 +299,7 @@ def volume_amplitude(distance_mm: float | None, cfg: RuntimeConfig) -> tuple[flo
         if not in_range:
             return 0.0, False
         return amp, True
-    if cfg.guitar_mode:
+    if cfg.guitar_mode or cfg.sampler_mode:
         return amp, in_range
     if not in_range:
         return default, False
@@ -344,6 +346,14 @@ class Pipeline:
         self._snap_note = None
         self.last_voice = None
         self.last_pick = None
+
+    def apply_sampler(self) -> None:
+        from theremin.sampler import sampler_scale
+
+        self.mapper.notes = sampler_scale()
+        self.mapper.reset()
+        self.cfg.scale_name = "Sampler"
+        self.cfg.custom_notes = None
 
     def apply_scale(self, name: str) -> None:
         if name == "Custom":
@@ -430,15 +440,16 @@ class Pipeline:
         else:
             gate = pitch_hand
 
-        if not gate and not cfg.guitar_mode and not cfg.snap_pick:
+        if not gate and not cfg.guitar_mode and not cfg.sampler_mode and not cfg.snap_pick:
             amp = 0.0
 
         retrigger = False
         pick_note = note
         pick_hz = hz
+        play_style = cfg.guitar_mode or cfg.sampler_mode
 
         if cfg.snap_pick:
-            # Swipe silently → on leave play only the nearest note (any instrument).
+            # Swipe silently → on leave play only the nearest zone (note or sample).
             if pitch_hand and pitch is not None:
                 if not self._was_gated:
                     self._snap_hz = None
@@ -450,6 +461,7 @@ class Pipeline:
                 freq_out = 0.0
                 amp_out = amp
                 note_out = None
+                sample_out = None
             elif self._was_gated and not pitch_hand and len(self._swipe_mm) >= 2:
                 pick_note, pick_hz = self._pick_nearest_note(self._swipe_mm, cfg)
                 self._swipe_mm.clear()
@@ -462,7 +474,7 @@ class Pipeline:
                     gate_out = bool(retrigger and sounding)
                     freq_out = self._snap_hz or 0.0
                     amp_out = amp if sounding else 0.0
-                elif cfg.guitar_mode:
+                elif play_style:
                     gate_out = retrigger
                     freq_out = self._snap_hz or 0.0
                     amp_out = amp
@@ -471,24 +483,28 @@ class Pipeline:
                     freq_out = self._snap_hz or 0.0
                     amp_out = amp if amp > 0 else cfg.default_amp
                 note_out = pick_note
+                sample_out = sample_index_for_note(pick_note) if cfg.sampler_mode else None
             elif self._snap_hz is not None:
-                if cfg.guitar_mode:
+                if play_style:
                     gate_out = False
                     freq_out = self._snap_hz
                     amp_out = amp
                     note_out = self._snap_note
+                    sample_out = sample_index_for_note(self._snap_note) if cfg.sampler_mode else None
                 elif cfg.flute_mode:
                     sounding = in_vol and amp >= 0.03
                     gate_out = sounding
                     freq_out = self._snap_hz
                     amp_out = amp if sounding else 0.0
                     note_out = self._snap_note
+                    sample_out = None
                 else:
                     sounding = in_vol and amp >= 0.04
                     gate_out = sounding
                     freq_out = self._snap_hz
                     amp_out = amp if sounding else 0.0
                     note_out = self._snap_note
+                    sample_out = sample_index_for_note(self._snap_note) if cfg.sampler_mode else None
             else:
                 if not pitch_hand:
                     self._swipe_mm.clear()
@@ -496,6 +512,7 @@ class Pipeline:
                 freq_out = self.last_voice.frequency_hz if self.last_voice else 0.0
                 amp_out = amp
                 note_out = None
+                sample_out = None
             if pitch_hand:
                 self._last_note = note
             else:
@@ -515,11 +532,12 @@ class Pipeline:
                 strike=strike,
                 in_pitch_range=in_pitch,
                 in_volume_range=in_vol,
+                sample_index=sample_out,
             )
             self.last_voice = voice
             return voice
 
-        if cfg.guitar_mode:
+        if play_style:
             if gate and note is not None and (note != self._last_note or not self._was_gated):
                 retrigger = True
         elif cfg.flute_mode:
@@ -535,7 +553,7 @@ class Pipeline:
             self._last_note = None
         self._was_gated = gate
 
-        if cfg.guitar_mode:
+        if play_style:
             freq_out = hz if gate else (self.last_voice.frequency_hz if self.last_voice else 0.0)
             amp_out = amp
             gate_out = gate
@@ -547,6 +565,8 @@ class Pipeline:
             freq_out = hz if gate or in_pitch else 0.0
             amp_out = amp if gate else 0.0
             gate_out = gate
+
+        sample_out = sample_index_for_note(note) if cfg.sampler_mode and retrigger else None
 
         voice = Voice(
             frequency_hz=freq_out,
@@ -562,6 +582,7 @@ class Pipeline:
             strike=strike,
             in_pitch_range=in_pitch,
             in_volume_range=in_vol,
+            sample_index=sample_out if cfg.sampler_mode else None,
         )
         self.last_voice = voice
         return voice

@@ -45,6 +45,7 @@ class Voice:
     strike: bool
     in_pitch_range: bool
     in_volume_range: bool
+    sample_index: int | None = None
 
 
 @dataclass
